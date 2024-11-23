@@ -1,0 +1,156 @@
+diff --git a/kalloc.c b/kalloc.c
+index 1ab0164..fdba86e 100644
+--- a/kalloc.c
++++ b/kalloc.c
+@@ -8,6 +8,7 @@
+ #include "memlayout.h"
+ #include "mmu.h"
+ #include "spinlock.h"
++#define NPID 40000
+ 
+ int kinit_flag = 0;
+ extern int PID[];
+@@ -73,7 +74,11 @@ freerange(void *vstart, void *vend)
+ 
+ uint hash(int pid, char *vpn) {
+   //TODO: Implement your own hash function
+-  return hash;
++    uint hash = pid;
++    hash ^= ((uint)vpn >> 3) * 31;
++    hash = ((hash >> 16) ^ hash) * 0x45d9f3b;
++    hash = (hash >> 16) ^ hash % NPID;
++    return hash;
+ }
+ 
+ void kfree(int pid, char *v){ // v is virtual address
+@@ -83,10 +88,34 @@ void kfree(int pid, char *v){ // v is virtual address
+   //TODO: Fill the code that supports kfree
+   //1. Find the corresponding physical address for given pid and VA
+   //To do 1), find the corresponding entry of inverted page table and read the PPN[idx]
++  idx = hash(pid, v); // (added)
++  while (PID[idx] != pid || VPN[idx] != (uint)v) {
++    idx = (idx + 1) % 40000; // Linear probing to handle collisions // (added)
++    if (idx == hash(pid, v)) { // Infinite loop check //debugging
++      cprintf("Error: Infinite loop in kfree due to collision.\n");
++      return;
++    }
++  }
++ 
+   //2. Initialize the PID[idx], VPN[idx], PPN[idx] and PTE_XV6[idx]
++  PID[idx] = -1; // (added)
++  VPN[idx] = 0; // (added)
++  PPN[idx] = 0; // (added)
++  PTE_XV6[idx] = 0; // (added)
++  kv = PPN[idx]; // (added)
+   //3. For memset(), convert the physical address for free to kernel's virtual address by using P2V macro
++  memset(P2V(kv), 1, PGSIZE); // (added)
+   //4. Insert the free page into kmem.freelist
+   // memset(kv, 1, PGSIZE); //TODO: You must perform memset for P2V(physical address);
++  if(kmem.use_lock)
++    acquire(&kmem.lock);
++  r = (struct run*)P2V(kv); // (modified)
++  r->next = kmem.freelist;
++  kmem.freelist = r;
++  if(kmem.use_lock)
++    release(&kmem.lock);
++
++  cprintf("kfree: Freed memory for PID %d, VA %x\n", pid, v); //debugging
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -148,12 +177,14 @@ kalloc(int pid, char *v)  // v is virtual address
+     acquire(&kmem.lock);
+ 
+   r = kmem.freelist;
+-  if (r) kmem.freelist = r->next;
+-  else {
++  //if (r) kmem.freelist = r->next;
++  if(!r) {
+ 	  if (kmem.use_lock) release(&kmem.lock);
+ 	  cprintf("No free memory\n");
+-	  return (char*)r;
++	  return 0;
+   }
++  kmem.freelist = r->next;
++  
+ 
+   //TODO: Fill the code that supports kalloc
+   
+@@ -165,6 +196,20 @@ kalloc(int pid, char *v)  // v is virtual address
+   
+   //3. Update the value of PID[idx], VPN[idx] and PPN[idx] (Do not update the PTE_XV6[idx] in this code!)
+   //4. Return (char*)(*r), if there is no free space, return 0
++  idx = hash(pid, v); // (added)
++  //cprintf("\n");
++  
++  while (PID[idx] != -1) {
++    cprintf("Hash collision for idx %d: PID %d, VA %x\n", idx, PID[idx], VPN[idx]); //(added) Debugging
++    idx = (idx + 1) % 40000; // Linear probing to handle collisions // (added)
++  }
++
++  if (v == (char*)-1) { // Kernel caller case // (added)
++    v = P2V(V2P(r)); }
++
++  PID[idx] = pid; // (added)
++  VPN[idx] = (uint)v; // (added)
++  PPN[idx] = V2P(r); // (added)
+ 
+   if(kmem.use_lock)
+     release(&kmem.lock);
+diff --git a/main.c b/main.c
+index 0b6229e..4527343 100644
+--- a/main.c
++++ b/main.c
+@@ -24,7 +24,7 @@ int
+ main(void)
+ {
+   for (int i = 0; i < MAXENTRY; i++){
+-	PID[i] = 0;
++	PID[i] = -1;
+ 	VPN[i] = 0;
+ 	PPN[i] = 0;
+ 	PTE_XV6[i] = 0;
+diff --git a/vm.c b/vm.c
+index 479d68b..656865b 100644
+--- a/vm.c
++++ b/vm.c
+@@ -12,6 +12,9 @@ extern uint PTE_XV6[];
+ extern uint PTE_KERN[];
+ extern int PID[];
+ extern uint VPN[];
++
++
++
+ pde_t *kpgdir;  // for use in scheduler()
+ static pde_t *null_pgdir; // used to force page faults
+ 
+@@ -54,8 +57,11 @@ ittraverse(int pid, pde_t *pgdir, const void *va, int alloc) //You don't have to
+     return &PTE_KERN[(uint)V2P(va)/PGSIZE]; 
+   }
+   else{
+-	//Implement 3) in here	
+-	return &PTE_XV6[idx];
++	//Implement 3) in here
++    idx = hash(pid, (char *)va); // (added)
++    while (PID[idx] != pid || VPN[idx] != (uint)va) { // (added)
++      idx = (idx + 1) % 40000;} //(added)
++	  return &PTE_XV6[idx];
+   }
+ }
+ 
+@@ -298,6 +304,15 @@ deallocuvm(int pid, pde_t *pgdir, uint oldsz, uint newsz){  // oldsz, newsz is v
+   a = PGROUNDUP(newsz);
+   //TODO: File the code that free the allocated pages by users
+   //For range in (a <= va < oldsz), if there are some pages that the process allocates, call kfree(pid, v)
++  for(; a < oldsz; a += PGSIZE){// (added)
++    pte = ittraverse(pid, pgdir, (void*)a, 0); // Find the page table entry // (added)
++    if (pte && (*pte & PTE_P)) {// (added)
++      pa = PTE_ADDR(*pte); // Get the physical address // (added)
++      if (PID[hash(pid, (char*)a)] == pid) {// (added)
++        kfree(pid, (char*)a); // Free the allocated page // (added)
++      }// (added)
++    }// (added)
++  }// (added)
+   return newsz; 
+ }
+ 
