@@ -1,0 +1,2 @@
+<Explain why bigger memtest incurs more context switches>
+I think that bigger memory tests can cause more frequent context switches due to page faults and memory allocation tasks requiring kernel mode transitions. Moreover, as the test duration increases, the scheduler can do more frequent context switches by interleaving execution with other processes.

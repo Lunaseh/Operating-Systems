@@ -1,0 +1,87 @@
+diff --git a/Makefile b/Makefile
+index a7ad839..db5d245 100644
+--- a/Makefile
++++ b/Makefile
+@@ -182,12 +182,17 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_memtest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+ 
+ -include *.d
+ 
++memtest: memtest.c #added
++	$(CC) $(CFLAGS) -o memtest memtest.c $(ULIB) $(UARCH)
++
++
+ clean: 
+ 	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
+ 	*.o *.d *.asm *.sym vectors.S bootblock entryother \
+diff --git a/proc.c b/proc.c
+index 806b1b1..f9bd27a 100644
+--- a/proc.c
++++ b/proc.c
+@@ -214,7 +214,9 @@ fork(void)
+ 
+   acquire(&ptable.lock);
+ 
++
+   np->state = RUNNABLE;
++  np->n_context_switch = 0;
+ 
+   release(&ptable.lock);
+ 
+@@ -248,8 +250,8 @@ exit(void)
+   curproc->cwd = 0;
+ 
+   acquire(&ptable.lock);
+-
+-  // Parent might be sleeping in wait().
++  // Print the number of context switches (cswitch)
++  cprintf("\n%s(%d) consumed %d bytes, performed %d context switches\n", curproc->name, curproc->pid, curproc->sz, curproc->n_context_switch); // (added) // Parent might be sleeping in wait().
+   wakeup1(curproc->parent);
+ 
+   // Pass abandoned children to init.
+@@ -261,6 +263,9 @@ exit(void)
+     }
+   }
+ 
++
++
++
+   // Jump into the scheduler, never to return.
+   curproc->state = ZOMBIE;
+   sched();
+@@ -336,6 +341,7 @@ scheduler(void)
+       if(p->state != RUNNABLE)
+         continue;
+ 
++
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+       // before jumping back to us.
+@@ -377,6 +383,9 @@ sched(void)
+   if(readeflags()&FL_IF)
+     panic("sched interruptible");
+   intena = mycpu()->intena;
++
++  p->n_context_switch++; //context switch 횟수 증가 (added)
++
+   swtch(&p->context, mycpu()->scheduler);
+   mycpu()->intena = intena;
+ }
+diff --git a/proc.h b/proc.h
+index 1647114..0f6cf65 100644
+--- a/proc.h
++++ b/proc.h
+@@ -49,6 +49,7 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int n_context_switch; //context switch 횟수 추적 (added)
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:

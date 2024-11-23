@@ -1,0 +1,209 @@
+diff --git a/Makefile b/Makefile
+index a7ad839..9cf024b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -171,6 +171,7 @@ UPROGS=\
+ 	_forktest\
+ 	_grep\
+ 	_init\
++	_hostname\
+ 	_kill\
+ 	_ln\
+ 	_ls\
+@@ -182,12 +183,23 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_memtest\
++
++_hostname: hostname.o $(ULIB) $(UARCH)
++	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o _hostname hostname.o $(ULIB)
++	$(OBJDUMP) -S _hostname > hostname.asm
++	$(OBJDUMP) -t _hostname | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > hostname.sym
++
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+ 
+ -include *.d
+ 
++memtest: memtest.c #added
++	$(CC) $(CFLAGS) -o memtest memtest.c $(ULIB) $(UARCH)
++
++
+ clean: 
+ 	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
+ 	*.o *.d *.asm *.sym vectors.S bootblock entryother \
+diff --git a/proc.c b/proc.c
+index 806b1b1..f9bd27a 100644
+--- a/proc.c
++++ b/proc.c
+@@ -214,7 +214,9 @@ fork(void)
+ 
+   acquire(&ptable.lock);
+ 
++
+   np->state = RUNNABLE;
++  np->n_context_switch = 0;
+ 
+   release(&ptable.lock);
+ 
+@@ -248,8 +250,8 @@ exit(void)
+   curproc->cwd = 0;
+ 
+   acquire(&ptable.lock);
+-
+-  // Parent might be sleeping in wait().
++  // Print the number of context switches (cswitch)
++  cprintf("\n%s(%d) consumed %d bytes, performed %d context switches\n", curproc->name, curproc->pid, curproc->sz, curproc->n_context_switch); // (added) // Parent might be sleeping in wait().
+   wakeup1(curproc->parent);
+ 
+   // Pass abandoned children to init.
+@@ -261,6 +263,9 @@ exit(void)
+     }
+   }
+ 
++
++
++
+   // Jump into the scheduler, never to return.
+   curproc->state = ZOMBIE;
+   sched();
+@@ -336,6 +341,7 @@ scheduler(void)
+       if(p->state != RUNNABLE)
+         continue;
+ 
++
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+       // before jumping back to us.
+@@ -377,6 +383,9 @@ sched(void)
+   if(readeflags()&FL_IF)
+     panic("sched interruptible");
+   intena = mycpu()->intena;
++
++  p->n_context_switch++; //context switch 횟수 증가 (added)
++
+   swtch(&p->context, mycpu()->scheduler);
+   mycpu()->intena = intena;
+ }
+diff --git a/proc.h b/proc.h
+index 1647114..0f6cf65 100644
+--- a/proc.h
++++ b/proc.h
+@@ -49,6 +49,7 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int n_context_switch; //context switch 횟수 추적 (added)
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/sh.c b/sh.c
+index 054bab9..f18ffd8 100644
+--- a/sh.c
++++ b/sh.c
+@@ -133,7 +133,11 @@ runcmd(struct cmd *cmd)
+ int
+ getcmd(char *buf, int nbuf)
+ {
+-  printf(2, "$ ");
++  char hostname[64]; // (added)
++  gethostname(hostname, sizeof(hostname)); // (added)
++
++  printf(2, "root@%s# ", hostname); // (modified)
++
+   memset(buf, 0, nbuf);
+   gets(buf, nbuf);
+   if(buf[0] == 0) // EOF
+diff --git a/syscall.c b/syscall.c
+index ee85261..29eb867 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,8 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_gethostname(void); // (added)
++extern int sys_sethostname(void); // (added)
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +128,8 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_gethostname]    sys_gethostname, // (added)
++[SYS_sethostname]    sys_sethostname, // (added)
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..acc225c 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_gethostname  22 // (added)
++#define SYS_sethostname  23 // (added)
+\ No newline at end of file
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..6b683f7 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,28 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++char hostname[64] = "DataLab";  // initial host name (added)
++
++int sys_gethostname(void) // (added)
++{
++  char *buf;
++  int len;
++
++  if (argstr(0, &buf) < 0 || argint(1, &len) < 0)// 사용자로부터 buffer pointer + length
++    return -1;
++  safestrcpy(buf, hostname, len);// 커널의 hostname을 사용자에게 복사
++  return 0;
++}
++
++int sys_sethostname(void) // (added)
++{
++  char *buf;
++  if (argstr(0, &buf) < 0) // 사용자로부터 새 호스트 이름 가져옴
++    return -1;
++
++  
++  safestrcpy(hostname, buf, sizeof(hostname)); // 새 호스트 이름을 커널에 복사
++  return 0;
++}
++
+diff --git a/user.h b/user.h
+index f341021..6bbf178 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int gethostname(char*, int); // (added)
++int sethostname(const char*); // (added)
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..68a3f10 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,6 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++
++SYSCALL(gethostname)
++SYSCALL(sethostname)
+\ No newline at end of file
