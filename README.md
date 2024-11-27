@@ -5,4 +5,4 @@
 2. Project 2: `make qemu-nox>usertests -j`
 
 ### Clean
-Make clean: `Make clean`
+Make clean: `make clean`
